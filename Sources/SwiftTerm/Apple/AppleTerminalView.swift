@@ -1029,6 +1029,8 @@ public struct TerminalViewStateSnapshot: Sendable {
     public let dimensions: TerminalDimensions
     public let cursor: Position
     public let viewportRow: Int
+    public let applicationCursor: Bool
+    public let bracketedPasteMode: Bool
     public let currentBidiState: BidiPresentationState
     public let bidiArrowKeySwap: Bool
     public let cursorStyle: CursorStyle

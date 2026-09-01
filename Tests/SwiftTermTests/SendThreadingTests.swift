@@ -280,11 +280,13 @@ struct SendThreadingTests {
     @MainActor
     @Test func viewStateAndBufferCopiesDoNotExposeLiveStorage() {
         let view = makeView()
-        view.feed(text: "first")
+        view.feed(text: "\u{1b}[?1h\u{1b}[?2004hfirst")
 
         let first = view.terminalStateSnapshot()
         let firstText = first.visibleRows.map(\.text).joined(separator: "\n")
         #expect(first.dimensions == view.terminalDimensions)
+        #expect(first.applicationCursor)
+        #expect(first.bracketedPasteMode)
         #expect(firstText.contains("first"))
         #expect(first.visibleRows.allSatisfy {
             $0.cellWidths.count == first.dimensions.cols
