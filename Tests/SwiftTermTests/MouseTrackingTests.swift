@@ -1064,6 +1064,39 @@ struct MouseTrackingTests {
         #expect(sentString == "\(esc)[<65;1;1M")
     }
 
+    /// Wheel button output remains delegated to every negotiated terminal mouse encoder.
+    @Test func scrollDownUsesEveryNegotiatedCoordinateEncoding() {
+        let cases: [(mode: Int, expected: [UInt8])] = [
+            (1005, [0x1b, 0x5b, 0x4d, 97, 43, 38]),
+            (1006, Array("\(esc)[<65;11;6M".utf8)),
+            (1015, Array("\(esc)[97;11;6M".utf8)),
+            (1016, Array("\(esc)[<65;70;80M".utf8)),
+        ]
+
+        for testCase in cases {
+            let (terminal, delegate) = TerminalTestHarness.makeTerminal()
+            terminal.feed(text: "\(esc)[?1000h\(esc)[?\(testCase.mode)h")
+            delegate.clearSentData()
+
+            let buttonFlags = terminal.encodeButton(
+                button: 5,
+                release: false,
+                shift: false,
+                meta: false,
+                control: false)
+            terminal.sendEvent(
+                buttonFlags: buttonFlags,
+                x: 10,
+                y: 5,
+                pixelX: 70,
+                pixelY: 80)
+
+            #expect(
+                delegate.sentData.flatMap { $0 } == testCase.expected,
+                "Mouse encoding mode \(testCase.mode) changed")
+        }
+    }
+
     @Test func scrollUpWithShiftSendEventEncodesSgrOutput() {
         let (terminal, delegate) = TerminalTestHarness.makeTerminal()
         terminal.feed(text: "\(esc)[?1000h")

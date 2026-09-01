@@ -33,6 +33,16 @@ public extension Notification.Name {
     static let terminalViewMetaModifierReset = Notification.Name("SwiftTerm.TerminalView.metaModifierReset")
 }
 
+/// Controls how direct touches interact with remote mouse reporting on iOS.
+public enum TouchMouseInteractionMode: Sendable {
+    /// Preserve SwiftTerm's default tap and drag behavior.
+    case automatic
+    /// Keep direct touches local even when the remote application enables mouse reporting.
+    case local
+    /// Send taps as left clicks and vertical one-finger pans as wheel events.
+    case scrollWheel
+}
+
 /**
  * TerminalView provides an AppKit/UIKit front-end to the `Terminal` terminal emulator.
  * It is up to a subclass to either wire the terminal emulator to a remote terminal
@@ -49,7 +59,7 @@ public extension Notification.Name {
  * Use the `configureNativeColors()` to set the defaults colors for the view to match the OS
  * defaults, otherwise, this uses its own set of defaults colors.
  */
-open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollViewDelegate, TerminalDelegate, UIPointerInteractionDelegate {
+open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollViewDelegate, TerminalDelegate, UIPointerInteractionDelegate, UIGestureRecognizerDelegate {
     let coreGraphicsRenderCache = CoreGraphicsRenderCache()
     let frameCaptureCache = FrameCaptureCache()
 
@@ -150,7 +160,36 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
      * If a client application has not indicated any use for mouse events, then this setting
      * does not do anything, and selection and panning are still processed.
      */
-    public var allowMouseReporting: Bool = true
+    public var allowMouseReporting: Bool = true {
+        didSet {
+            guard touchMouseInteractionMode != .automatic else { return }
+            touchMouseWheelAccumulator.reset()
+            updateMousePanGestureAvailability()
+        }
+    }
+
+    /// Direct-touch mouse policy. Read and update this property from the main-thread UIKit owner.
+    public var touchMouseInteractionMode: TouchMouseInteractionMode = .automatic {
+        didSet {
+            guard oldValue != touchMouseInteractionMode else { return }
+            touchMouseWheelAccumulator.reset()
+            disableMousePanGesture()
+            updateMousePanGestureAvailability()
+        }
+    }
+
+    /// Whether the remote application currently requests a supported mouse tracking mode.
+    public var remoteMouseModeEnabled: Bool {
+        withTerminal { $0.mouseMode != .off }
+    }
+
+    /// Delivers content-free remote mouse availability changes on the main-thread UIKit callback.
+    public var remoteMouseModeChangedHandler: ((Bool) -> Void)?
+
+    /// When installed, consumes a completed double tap before selection or remote click handling.
+    public var doubleTapHandler: (() -> Void)?
+
+    var touchMouseWheelAccumulator = TouchMouseWheelAccumulator()
 
     /// Controls how link tracking resolves hovered links:
     /// `.explicit` = OSC 8 only, `.implicit` = explicit + implicit fallback, `.none` = off.
@@ -577,6 +616,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     @MainActor
     @discardableResult
     public func updateUiClosed() -> Bool {
+        touchMouseWheelAccumulator.reset()
         guard uiShutdownState != .stopped else { return true }
         uiShutdownState = .stopping
         frameDriver.shutdown()
@@ -655,6 +695,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     }
     
     @objc func resetCmd(_ sender: Any?) {
+        touchMouseWheelAccumulator.reset()
         withTerminal { terminal in
             terminal.cmdReset()
             selection.selectNone()
@@ -732,6 +773,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     @objc func longPress (_ gestureRecognizer: UILongPressGestureRecognizer)
     {
          if gestureRecognizer.state == .began {
+             touchMouseWheelAccumulator.reset()
              let _ = self.becomeFirstResponder()
              let tapLocation = gestureRecognizer.location(in: gestureRecognizer.view)
              let tapRegion = makeContextMenuRegionForTap (point: tapLocation)
@@ -841,6 +883,80 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         terminalAccessory?.controlModifier = false
         controlModifier = false
     }
+
+    func sendTouchMouseWheelEvent(_ direction: TouchMouseWheelDirection, at point: CGPoint)
+    {
+        withTerminal { terminal in
+            let hit = calculateTapHitLocked(point: point)
+            let displayBuffer = terminal.displayBuffer
+            let screenColumn = min(max(hit.grid.col, 0), max(terminal.cols - 1, 0))
+            let screenRow = min(max(hit.grid.row - displayBuffer.yDisp, 0), max(terminal.rows - 1, 0))
+            let buttonFlags = terminal.encodeButton(
+                button: direction == .up ? 4 : 5,
+                release: false,
+                shift: false,
+                meta: false,
+                control: false)
+            terminal.sendEvent(
+                buttonFlags: buttonFlags,
+                x: screenColumn,
+                y: screenRow,
+                pixelX: hit.pixels.col,
+                pixelY: hit.pixels.row)
+        }
+    }
+
+    @discardableResult
+    func consumeDoubleTapHandlerIfInstalled() -> Bool
+    {
+        guard let doubleTapHandler else { return false }
+        doubleTapHandler()
+        return true
+    }
+
+    private func performLocalSingleTap(_ gestureRecognizer: UITapGestureRecognizer)
+    {
+        guard gestureRecognizer.view != nil, gestureRecognizer.state == .ended else { return }
+        guard isFirstResponder else {
+            _ = becomeFirstResponder()
+            return
+        }
+
+        let tapHit = calculateTapHit(gesture: gestureRecognizer).grid
+        if let result = linkForClick(at: tapHit, hasCommandModifier: commandActive) {
+            terminalDelegate?.requestOpenLink(source: self, link: result.link, params: result.params)
+            return
+        }
+
+        let state = withTerminal { terminal -> (hadSelection: Bool, snapshot: SemanticPromptPointerSnapshot, cursor: Position) in
+            let snapshot = SemanticPromptPointerSnapshot(
+                selectionWasActive: selection.active,
+                didDrag: false,
+                clickCount: 1,
+                pressWasSemanticEligible: true)
+            let hadSelection = selection.active
+            if selection.active { selection.selectNone() }
+            let buffer = terminal.displayBuffer
+            return (hadSelection, snapshot, Position(col: buffer.x, row: buffer.y + buffer.yBase))
+        }
+        if state.hadSelection { disableSelectionPanGesture() }
+        if UIMenuController.shared.isMenuVisible {
+            UIMenuController.shared.hideMenu()
+        } else {
+            let location = gestureRecognizer.location(in: gestureRecognizer.view)
+            if abs(tapHit.col - state.cursor.col) < 4 && abs(tapHit.row - state.cursor.row) < 2 {
+                showContextMenu(forRegion: makeContextMenuRegionForTap(point: location), pos: tapHit)
+            } else {
+                _ = withTerminal { terminal in
+                    terminal.handleSemanticPromptClick(
+                        at: tapHit,
+                        modifiers: semanticPromptModifiers(for: gestureRecognizer),
+                        snapshot: state.snapshot)
+                }
+            }
+        }
+        frameDriver.markDirty()
+    }
     
     // Returns offsets for the first and last visible terminal buffer lines.
     func getVisibleLineRange () -> ClosedRange<Int> {
@@ -896,6 +1012,25 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
 
     @objc func singleTap (_ gestureRecognizer: UITapGestureRecognizer)
     {
+        if touchMouseInteractionMode != .automatic {
+            guard gestureRecognizer.view != nil, gestureRecognizer.state == .ended else { return }
+            let mouseMode = withTerminal { $0.mouseMode }
+            if touchMouseInteractionMode == .scrollWheel,
+               allowMouseReporting,
+               !shiftBypassesMouseReporting(for: gestureRecognizer),
+               mouseMode.sendButtonPress() {
+                sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: false)
+                if mouseMode.sendButtonRelease() {
+                    sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: true)
+                }
+                frameDriver.markDirty()
+                return
+            }
+
+            performLocalSingleTap(gestureRecognizer)
+            return
+        }
+
         if isFirstResponder {
             guard gestureRecognizer.view != nil else { return }
 
@@ -966,7 +1101,26 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             return
         }
 
-        if tapAction(tapCount: 2, gestureRecognizer: gestureRecognizer) == .selectWord {
+        if consumeDoubleTapHandlerIfInstalled() { return }
+
+        if touchMouseInteractionMode == .scrollWheel {
+            let mouseMode = withTerminal { $0.mouseMode }
+            if allowMouseReporting,
+               !shiftBypassesMouseReporting(for: gestureRecognizer),
+               mouseMode.sendButtonPress() {
+                sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: false)
+                if mouseMode.sendButtonRelease() {
+                    sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: true)
+                }
+                frameDriver.markDirty()
+                return
+            }
+        }
+
+        let action: TerminalTapAction = touchMouseInteractionMode == .local
+            ? .selectWord
+            : tapAction(tapCount: 2, gestureRecognizer: gestureRecognizer)
+        if action == .selectWord {
             let hit = calculateTapHit(gesture: gestureRecognizer).grid
             withTerminal { terminal in
                 selection.selectWordOrExpression(at: hit, in: terminal.displayBuffer)
@@ -986,7 +1140,24 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             return
         }
 
-        if tapAction(tapCount: 3, gestureRecognizer: gestureRecognizer) == .selectLine {
+        if touchMouseInteractionMode == .scrollWheel {
+            let mouseMode = withTerminal { $0.mouseMode }
+            if allowMouseReporting,
+               !shiftBypassesMouseReporting(for: gestureRecognizer),
+               mouseMode.sendButtonPress() {
+                sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: false)
+                if mouseMode.sendButtonRelease() {
+                    sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: true)
+                }
+                frameDriver.markDirty()
+                return
+            }
+        }
+
+        let action: TerminalTapAction = touchMouseInteractionMode == .local
+            ? .selectLine
+            : tapAction(tapCount: 3, gestureRecognizer: gestureRecognizer)
+        if action == .selectLine {
             let hit = calculateTapHit(gesture: gestureRecognizer).grid
             withTerminal { _ in selection.select(row: hit.row) }
             enableSelectionPanGesture()
@@ -1075,6 +1246,34 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     
     @objc func panMouseHandler (_ gestureRecognizer: UIPanGestureRecognizer){
         guard gestureRecognizer.view != nil else { return }
+
+        if touchMouseInteractionMode == .local {
+            touchMouseWheelAccumulator.reset()
+            return
+        }
+
+        if touchMouseInteractionMode == .scrollWheel {
+            let state = gestureRecognizer.state
+            let terminalState = withTerminal { terminal in
+                (mouseEnabled: terminal.mouseMode != .off, selectionActive: selection.active)
+            }
+            let reportingAllowed = allowMouseReporting &&
+                !shiftBypassesMouseReporting(for: gestureRecognizer) &&
+                terminalState.mouseEnabled &&
+                !terminalState.selectionActive
+            handleTouchMouseWheelPanChange(
+                state: state,
+                touchCount: gestureRecognizer.numberOfTouches,
+                deltaY: gestureRecognizer.translation(in: self).y,
+                location: gestureRecognizer.location(in: self),
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                reportingAllowed: reportingAllowed)
+            if state == .began || state == .changed {
+                gestureRecognizer.setTranslation(.zero, in: self)
+            }
+            return
+        }
+
         let mouseMode = withTerminal { $0.mouseMode }
         if allowMouseReporting && !shiftBypassesMouseReporting(for: gestureRecognizer) && mouseMode != .off {
             switch gestureRecognizer.state {
@@ -1104,6 +1303,88 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             default:
                 break
             }
+        }
+    }
+
+    func handleTouchMouseWheelPanChange(
+        state: UIGestureRecognizer.State,
+        touchCount: Int,
+        deltaY: Double,
+        location: CGPoint,
+        timestamp: TimeInterval,
+        reportingAllowed: Bool
+    ) {
+        switch state {
+        case .ended, .cancelled, .failed:
+            touchMouseWheelAccumulator.reset()
+            return
+        case .began:
+            touchMouseWheelAccumulator.reset()
+            guard reportingAllowed, touchCount == 1 else { return }
+        case .changed:
+            guard reportingAllowed, touchCount == 1 else {
+                touchMouseWheelAccumulator.reset()
+                return
+            }
+            if let direction = touchMouseWheelAccumulator.consume(
+                deltaY: deltaY,
+                cellHeight: Double(cellDimension.height),
+                timestamp: timestamp) {
+                sendTouchMouseWheelEvent(direction, at: location)
+            }
+        default:
+            break
+        }
+    }
+
+    public override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool
+    {
+        guard gestureRecognizer === panMouseGesture,
+              touchMouseInteractionMode == .scrollWheel else {
+            return true
+        }
+        let selectionActive = withTerminal { _ in selection.active }
+        guard !selectionActive else {
+            touchMouseWheelAccumulator.reset()
+            return false
+        }
+        if let selectionState = panSelectionGesture?.state,
+           selectionState == .began || selectionState == .changed {
+            touchMouseWheelAccumulator.reset()
+            return false
+        }
+        return remoteMouseModeEnabled && allowMouseReporting
+    }
+
+    public func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        guard touchMouseInteractionMode == .scrollWheel,
+              gestureRecognizer === panMouseGesture || otherGestureRecognizer === panMouseGesture else {
+            return false
+        }
+        let other = gestureRecognizer === panMouseGesture ? otherGestureRecognizer : gestureRecognizer
+        return other is UIPinchGestureRecognizer
+    }
+
+    private func updateMousePanGestureAvailability(remoteMouseEnabled: Bool? = nil)
+    {
+        let isRemoteMouseEnabled = remoteMouseEnabled ?? self.remoteMouseModeEnabled
+        let shouldEnable: Bool
+        switch touchMouseInteractionMode {
+        case .automatic:
+            shouldEnable = isRemoteMouseEnabled
+        case .local:
+            shouldEnable = false
+        case .scrollWheel:
+            shouldEnable = isRemoteMouseEnabled && allowMouseReporting
+        }
+
+        if shouldEnable {
+            enableMousePanGesture()
+        } else {
+            disableMousePanGesture()
         }
     }
    
@@ -1203,6 +1484,10 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             return
         }
         let gesture = UIPanGestureRecognizer (target: self, action: #selector(panMouseHandler))
+        gesture.delegate = self
+        if touchMouseInteractionMode == .scrollWheel {
+            gesture.maximumNumberOfTouches = 1
+        }
         addGestureRecognizer(gesture)
         panMouseGesture = gesture
     }
@@ -3369,14 +3654,12 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     }
     
     nonisolated open func mouseModeChanged(source: Terminal) {
-        let mouseMode = source.mouseMode
+        let isEnabled = source.mouseMode != .off
         onMain { [weak self] in
             guard let self else { return }
-            if mouseMode != .off {
-                self.enableMousePanGesture()
-            } else {
-                self.disableMousePanGesture()
-            }
+            self.touchMouseWheelAccumulator.reset()
+            self.updateMousePanGestureAvailability(remoteMouseEnabled: isEnabled)
+            self.remoteMouseModeChangedHandler?(isEnabled)
         }
     }
     
