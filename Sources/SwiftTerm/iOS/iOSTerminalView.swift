@@ -189,6 +189,9 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     /// When installed, consumes a completed double tap before selection or remote click handling.
     public var doubleTapHandler: (() -> Void)?
 
+    /// Delivers copied selection availability after the UIKit selection state is synchronized.
+    public var selectionChangedHandler: ((Bool) -> Void)?
+
     var touchMouseWheelAccumulator = TouchMouseWheelAccumulator()
 
     /// Controls how link tracking resolves hovered links:
@@ -3638,6 +3641,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
                 self.withTerminal { _ in self.selection.selectNone() }
                 self.disableSelectionPanGesture()
             }
+            self.selectionChangedHandler?(self.selectionActive)
         }
     }
 
