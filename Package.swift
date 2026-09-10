@@ -135,6 +135,11 @@ let targets: [Target] = [
             .copy("Fixtures/GhosttyFuzzCorpus"),
             .copy("KittyGraphics/Fixtures")
         ]
+    ),
+    .testTarget(
+        name: "SwiftTermIOSTests",
+        dependencies: ["SwiftTerm"],
+        path: "Tests/SwiftTermIOSTests"
     )
 ] + buildInfoTargets
 #endif

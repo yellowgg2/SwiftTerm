@@ -2155,17 +2155,13 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             return
         }
 
-        // Freeze auto-follow only while the finger is physically down
-        // (isTracking). Excluding the momentum coast is essential: after the
-        // finger lifts, deceleration keeps firing sync while streaming output
-        // extends the content and the bottom recedes ahead of the coasting
-        // offset — treating that "not at the bottom yet" reading as a manual
-        // scroll would re-freeze a view the user just flung to the bottom. This
-        // must key off isTracking, not isDragging: on device isDragging stays
-        // true through the entire coast, so it fails to exclude momentum. It also
-        // covers layout/system-driven offset changes (startup sizing, rotation,
-        // keyboard insets, buffer shrink), which are never a manual scroll.
-        guard isTracking else {
+        // Start manual history navigation only while the finger is down. Once
+        // history mode is active, keep yDisp aligned with contentOffset during
+        // the momentum coast so the snapshot contains the rows being rendered.
+        // Deceleration alone must not enter history mode: streaming output can
+        // otherwise re-freeze a view the user just flung back to the bottom.
+        let synchronizesManualScroll = isTracking || (userScrolling && isDecelerating)
+        guard synchronizesManualScroll else {
             return
         }
 
