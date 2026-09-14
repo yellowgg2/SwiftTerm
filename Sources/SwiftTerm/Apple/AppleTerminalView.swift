@@ -2986,6 +2986,15 @@ extension TerminalView {
         let kittyCellHeight = cellDimension.height
         let kittyImageScale = getImageScale()
         renderOwner.withSnapshotForDrawing(viewState: viewState) { snapshot, renderContext in
+#if DEBUG && (os(iOS) || os(visionOS))
+        traceScrollDebug(
+            "draw",
+            yDisp: snapshot.yDisp,
+            rows: snapshot.rowCount,
+            lines: snapshot.linesCount,
+            snapshotFirstRow: snapshot.firstRow
+        )
+#endif
         let yOffset = renderContext.baselineOffset
         #if os(macOS)
         let renderBufferOffset = snapshot.yDisp

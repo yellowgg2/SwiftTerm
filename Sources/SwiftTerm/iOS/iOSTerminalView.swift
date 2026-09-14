@@ -2067,6 +2067,42 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     var userScrolling = false
     private var updatingContentOffsetFromTerminal = false
     private var manualScrollOffsetWithinRow: CGFloat = 0
+#if DEBUG
+    private var lastScrollDebugSignature: String?
+
+    func traceScrollDebug(
+        _ phase: String,
+        yDisp: Int,
+        rows: Int,
+        lines: Int,
+        snapshotFirstRow: Int? = nil
+    ) {
+        let offsetBucket = Int(contentOffset.y / 4) * 4
+        let signature = [
+            phase,
+            String(offsetBucket),
+            String(Int(bounds.height)),
+            String(yDisp),
+            String(rows),
+            String(lines),
+            String(snapshotFirstRow ?? -1),
+            String(isTracking),
+            String(isDecelerating),
+            String(userScrolling)
+        ].joined(separator: ":")
+        guard signature != lastScrollDebugSignature else { return }
+        lastScrollDebugSignature = signature
+        let snapshotFirst = snapshotFirstRow.map(String.init) ?? "nil"
+        print(
+            "[SwiftTermScroll] phase=\(phase) offsetY=\(contentOffset.y) " +
+            "boundsY=\(bounds.origin.y) boundsH=\(bounds.height) contentH=\(contentSize.height) " +
+            "yDisp=\(yDisp) rows=\(rows) lines=\(lines) " +
+            "snapshotFirst=\(snapshotFirst) " +
+            "tracking=\(isTracking) dragging=\(isDragging) decelerating=\(isDecelerating) " +
+            "userScrolling=\(userScrolling) metal=\(isUsingMetalRenderer)"
+        )
+    }
+#endif
 
     private var contentOffsetTolerance: CGFloat {
         1 / max(backingScaleFactor(), 1)
@@ -2144,16 +2180,20 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         // short of the exact maximum, so the freeze never disengaged.
         let atBottomThreshold = max(contentOffsetTolerance, cellDimension.height / 2)
         if offsetY >= maxContentOffset - atBottomThreshold {
-            let displayRowChanged = withTerminal { terminal in
+            let result = withTerminal { terminal in
                 let displayBuffer = terminal.displayBuffer
                 let maxRow = maxDisplayRow(in: displayBuffer)
                 let displayRowChanged = setDisplayRowLocked(maxRow, terminal: terminal)
                 setManualScrollingLocked(false, terminal: terminal)
-                return displayRowChanged
+                return (displayRowChanged, displayBuffer.yDisp, displayBuffer.rows,
+                        displayBuffer.lines.count)
             }
-            if displayRowChanged {
+            if result.0 {
                 frameDriver.markDirty()
             }
+#if DEBUG
+            traceScrollDebug("sync-bottom", yDisp: result.1, rows: result.2, lines: result.3)
+#endif
             return
         }
 
@@ -2164,10 +2204,17 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         // otherwise re-freeze a view the user just flung back to the bottom.
         let synchronizesManualScroll = isTracking || (userScrolling && isDecelerating)
         guard synchronizesManualScroll else {
+#if DEBUG
+            let state = withTerminal { terminal in
+                let displayBuffer = terminal.displayBuffer
+                return (displayBuffer.yDisp, displayBuffer.rows, displayBuffer.lines.count)
+            }
+            traceScrollDebug("sync-skipped", yDisp: state.0, rows: state.1, lines: state.2)
+#endif
             return
         }
 
-        let displayRowChanged = withTerminal { terminal in
+        let result = withTerminal { terminal in
             let displayBuffer = terminal.displayBuffer
             let maxRow = maxDisplayRow(in: displayBuffer)
             let row = max(0, min(maxRow, Int(floor((offsetY + contentOffsetTolerance) /
@@ -2175,11 +2222,15 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             manualScrollOffsetWithinRow = offsetY - CGFloat(row) * cellDimension.height
             let displayRowChanged = setDisplayRowLocked(row, terminal: terminal)
             setManualScrollingLocked(true, terminal: terminal)
-            return displayRowChanged
+            return (displayRowChanged, displayBuffer.yDisp, displayBuffer.rows,
+                    displayBuffer.lines.count)
         }
-        if displayRowChanged {
+        if result.0 {
             frameDriver.markDirty()
         }
+#if DEBUG
+        traceScrollDebug("sync-manual", yDisp: result.1, rows: result.2, lines: result.3)
+#endif
     }
 
     private func setDisplayRowLocked(_ row: Int, terminal: Terminal) -> Bool {
