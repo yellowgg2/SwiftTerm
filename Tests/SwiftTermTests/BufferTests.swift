@@ -31,6 +31,59 @@ final class BufferTests: TerminalDelegate {
         #expect(buffer.lines[3].bidiState == initialState)
     }
 
+    /// Growing the viewport keeps cleared rows below a cursor that is already near the top.
+    @Test func resizeGrowthPreservesClearedScreenWhenRowsRemainBelowCursor() {
+        let terminal = Terminal(
+            delegate: self,
+            options: TerminalOptions(cols: 80, rows: 24, scrollback: 1_000))
+
+        for index in 1...40 {
+            terminal.feed(text: "output line \(index)\r\n")
+        }
+        terminal.feed(text: "\u{1b}[H\u{1b}[2J")
+        terminal.feed(text: "$ ")
+
+        let initialYBase = terminal.buffer.yBase
+        #expect(initialYBase > 0)
+        #expect(terminal.getCursorLocation().y == 0)
+        #expect(terminal.getLine(row: 0)?.translateToString(trimRight: true) == "$ ")
+
+        terminal.resize(cols: 80, rows: 40)
+
+        #expect(terminal.buffer.yBase == initialYBase)
+        #expect(terminal.getCursorLocation().y == 0)
+        #expect(terminal.getLine(row: 0)?.translateToString(trimRight: true) == "$ ")
+
+        terminal.resize(cols: 80, rows: 24)
+
+        #expect(terminal.buffer.yBase == initialYBase)
+        #expect(terminal.getCursorLocation().y == 0)
+        #expect(terminal.getLine(row: 0)?.translateToString(trimRight: true) == "$ ")
+    }
+
+    /// Growing the viewport pulls existing history down while preserving a bottom cursor's absolute row.
+    @Test func resizeGrowthPullsScrollbackWhenCursorIsAtBottom() {
+        let terminal = Terminal(
+            delegate: self,
+            options: TerminalOptions(cols: 80, rows: 24, scrollback: 1_000))
+
+        for index in 1...40 {
+            terminal.feed(text: "output line \(index)\r\n")
+        }
+
+        let initialYBase = terminal.buffer.yBase
+        let initialCursorY = terminal.getCursorLocation().y
+        let initialAbsoluteCursorY = initialYBase + initialCursorY
+        #expect(initialYBase >= 16)
+        #expect(initialCursorY == 23)
+
+        terminal.resize(cols: 80, rows: 40)
+
+        #expect(terminal.buffer.yBase == initialYBase - 16)
+        #expect(terminal.getCursorLocation().y == initialCursorY + 16)
+        #expect(terminal.buffer.yBase + terminal.getCursorLocation().y == initialAbsoluteCursorY)
+    }
+
     /// Test for issue #256: yBase was not reset in Buffer.clear(), causing crashes
     /// when switching between normal and alternate buffers.
     ///

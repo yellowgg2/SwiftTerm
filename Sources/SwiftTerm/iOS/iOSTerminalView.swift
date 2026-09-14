@@ -2144,13 +2144,15 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         // short of the exact maximum, so the freeze never disengaged.
         let atBottomThreshold = max(contentOffsetTolerance, cellDimension.height / 2)
         if offsetY >= maxContentOffset - atBottomThreshold {
-            withTerminal { terminal in
+            let displayRowChanged = withTerminal { terminal in
                 let displayBuffer = terminal.displayBuffer
                 let maxRow = maxDisplayRow(in: displayBuffer)
-                if displayBuffer.yDisp != maxRow {
-                    terminal.setViewYDisp(maxRow)
-                }
+                let displayRowChanged = setDisplayRowLocked(maxRow, terminal: terminal)
                 setManualScrollingLocked(false, terminal: terminal)
+                return displayRowChanged
+            }
+            if displayRowChanged {
+                frameDriver.markDirty()
             }
             return
         }
@@ -2165,17 +2167,27 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             return
         }
 
-        withTerminal { terminal in
+        let displayRowChanged = withTerminal { terminal in
             let displayBuffer = terminal.displayBuffer
             let maxRow = maxDisplayRow(in: displayBuffer)
             let row = max(0, min(maxRow, Int(floor((offsetY + contentOffsetTolerance) /
                 cellDimension.height))))
             manualScrollOffsetWithinRow = offsetY - CGFloat(row) * cellDimension.height
-            if displayBuffer.yDisp != row {
-                terminal.setViewYDisp(row)
-            }
+            let displayRowChanged = setDisplayRowLocked(row, terminal: terminal)
             setManualScrollingLocked(true, terminal: terminal)
+            return displayRowChanged
         }
+        if displayRowChanged {
+            frameDriver.markDirty()
+        }
+    }
+
+    private func setDisplayRowLocked(_ row: Int, terminal: Terminal) -> Bool {
+        terminal.terminalLock.preconditionLocked()
+        guard terminal.displayBuffer.yDisp != row else { return false }
+        terminal.setViewYDisp(row)
+        terminal.refresh(startRow: 0, endRow: terminal.rows)
+        return true
     }
 
     func getCurrentGraphicsContext () -> CGContext?

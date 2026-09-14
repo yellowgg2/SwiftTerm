@@ -14,6 +14,23 @@ private final class ScrollStateTerminalView: TerminalView {
 
 @MainActor
 struct IOSScrollSynchronizationTests {
+    /// Local history navigation invalidates every visible row so Core Graphics prepares a snapshot at the new display row.
+    @Test func localScrollInvalidatesVisibleRowsForSnapshotRefresh() {
+        let view = makeSUT()
+        let bottomRow = view.withTerminal { terminal in
+            terminal.clearUpdateRange()
+            return terminal.displayBuffer.yDisp
+        }
+        let historyRow = max(0, bottomRow - 4)
+
+        view.reportsTracking = true
+        view.contentOffset.y = CGFloat(historyRow) * view.cellDimension.height
+
+        let updateRange = view.withTerminal { $0.getUpdateRange() }
+        #expect(updateRange?.startY == 0)
+        #expect(updateRange?.endY == view.withTerminal { $0.rows })
+    }
+
     /// Upward momentum keeps the terminal snapshot row aligned with UIScrollView after the finger lifts.
     @Test func upwardDecelerationSynchronizesDisplayRowAfterTrackingEnds() {
         let view = makeSUT()
@@ -56,8 +73,10 @@ struct IOSScrollSynchronizationTests {
         let view = ScrollStateTerminalView(
             frame: CGRect(origin: .zero, size: .init(width: 320, height: 160))
         )
-        for line in 0..<80 {
-            view.feed(text: "line \(line)\r\n")
+        view.withTerminal { terminal in
+            for line in 0..<80 {
+                terminal.feed(text: "line \(line)\r\n")
+            }
         }
         view.updateScroller()
         return view
